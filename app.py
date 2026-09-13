@@ -806,6 +806,27 @@ def api_search():
         return jsonify({'success': False, 'message': '请输入搜索关键词'})
     
     results = search_stocks(keyword)
+    
+    # 备用方案：如果输入是6位纯数字代码，直接尝试获取行情验证
+    # 这样搜索API失败时，直接输代码也能添加
+    if len(results) == 0 and keyword.isdigit() and len(keyword) == 6:
+        quote = get_stock_quote(keyword)
+        if quote and quote.get('name'):
+            results = [{
+                'code': keyword,
+                'name': quote['name'],
+                'market': 2 if keyword.startswith('3') or keyword.startswith('0') else 1,
+                'mktNum': ''
+            }]
+    
+    # 修复名称编码问题（东方财富搜索API返回的名称有时是乱码）
+    for r in results:
+        if r.get('name') and ('Ã' in r['name'] or 'é' in r['name'] or '¿' in r['name']):
+            # 名称乱码，尝试用行情接口获取正确名称
+            quote = get_stock_quote(r['code'])
+            if quote and quote.get('name'):
+                r['name'] = quote['name']
+    
     return jsonify({'success': True, 'data': results})
 
 

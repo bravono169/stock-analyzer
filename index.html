@@ -1058,20 +1058,48 @@ async function doSearch() {
   var res = await apiGet('/api/search?q=' + encodeURIComponent(keyword));
 
   if (!res.success || !res.data || res.data.length === 0) {
-    resultsEl.innerHTML = '<div class="empty-state" style="padding:30px;">未找到相关股票</div>';
+    // 如果输入的是6位纯数字，显示"直接添加"按钮
+    if (/^\d{6}$/.test(keyword)) {
+      var exists = isInWatchlist(keyword);
+      resultsEl.innerHTML = 
+        '<div style="padding:20px;text-align:center;">' +
+          '<div style="font-size:17px;margin-bottom:10px;">股票代码 ' + keyword + '</div>' +
+          '<div style="font-size:14px;color:#999;margin-bottom:15px;">搜索暂无结果，可直接添加</div>' +
+          '<button class="add-btn" style="background:linear-gradient(135deg,#ff6b6b,#ee5a24);color:#fff;border:none;padding:10px 30px;border-radius:20px;font-size:16px;" onclick="addByCode(\'' + keyword + '\')" ' + (exists ? ' disabled style="background:#999;"' : '') + '>' +
+          (exists ? '已在自选股中' : '+ 直接添加') + '</button>' +
+        '</div>';
+    } else {
+      resultsEl.innerHTML = '<div class="empty-state" style="padding:30px;">未找到相关股票</div>';
+    }
     return;
   }
 
   var html = '';
   for (var i = 0; i < res.data.length; i++) {
     var item = res.data[i];
+    var stockName = item.name || item.code;
     var exists = isInWatchlist(item.code);
     html += '<div class="search-item" onclick="openDetail(\'' + item.code + '\')">' +
-      '<div><div class="name">' + item.name + '</div><div class="code">' + item.code + '</div></div>' +
-      '<button class="add-btn" onclick="event.stopPropagation(); addToWatchlist({code:\'' + item.code + '\',name:\'' + item.name + '\'}); this.textContent=\'已添加\'; this.style.background=\'#999\';"' + (exists ? ' style="background:#999;"' : '') + '>' +
+      '<div><div class="name">' + stockName + '</div><div class="code">' + item.code + '</div></div>' +
+      '<button class="add-btn" onclick="event.stopPropagation(); addToWatchlist({code:\'' + item.code + '\',name:\'' + stockName.replace(/'/g, '\\\'') + '\'}); this.textContent=\'已添加\'; this.style.background=\'#999\';"' + (exists ? ' style="background:#999;"' : '') + '>' +
       (exists ? '已添加' : '+ 添加') + '</button></div>';
   }
   resultsEl.innerHTML = html;
+}
+
+// 直接通过代码添加股票（搜索失败时的备用方案）
+async function addByCode(code) {
+  if (isInWatchlist(code)) return;
+  
+  // 先获取行情验证股票存在并拿到名称
+  var res = await apiGet('/api/quote?code=' + code);
+  if (res.success && res.data) {
+    addToWatchlist({ code: code, name: res.data.name || code });
+  } else {
+    addToWatchlist({ code: code, name: code });
+  }
+  document.getElementById('searchResults').classList.remove('show');
+  document.getElementById('searchInput').value = '';
 }
 
 // ============================================
