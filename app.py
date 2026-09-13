@@ -1,6 +1,6 @@
-"""
+﻿"""
 智投分析 - 股票分析后端服务
-提供真实股票数据API，支持东方财富公开数据源
+多数据源备份：东方财富、腾讯财经、新浪财经
 """
 
 from flask import Flask, jsonify, request, send_from_directory
@@ -14,16 +14,142 @@ from datetime import datetime, timedelta
 app = Flask(__name__, static_folder='.', static_url_path='')
 CORS(app)
 
-# ==================== 东方财富API封装 ====================
+# ==================== 通用请求头 ====================
 
-HEADERS = {
+HEADERS_EASTMONEY = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Referer': 'https://quote.eastmoney.com/'
 }
 
-def get_stock_quote(code):
-    """获取股票实时行情（带重试）"""
-    for attempt in range(3):
+HEADERS_SINA = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Referer': 'https://finance.sina.com.cn'
+}
+
+HEADERS_TENCENT = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Referer': 'https://gu.qq.com/'
+}
+
+# ==================== 新浪财经API ====================
+
+def get_sina_quote(code):
+    """新浪财经实时行情"""
+    if code.startswith('6'):
+        symbol = f'sh{code}'
+    else:
+        symbol = f'sz{code}'
+    
+    url = f'https://hq.sinajs.cn/list={symbol}'
+    
+    try:
+        resp = requests.get(url, headers=HEADERS_SINA, timeout=8)
+        resp.encoding = 'gbk'
+        text = resp.text
+        
+        # 解析格式: var hq_str_sh600519="贵州茅台,1680.00,1675.00,...";
+        start = text.find('"')
+        end = text.rfind('"')
+        if start < 0 or end <= start:
+            return None
+        
+        data_str = text[start+1:end]
+        fields = data_str.split(',')
+        if len(fields) < 32:
+            return None
+        
+        price = float(fields[3])
+        pre_close = float(fields[2])
+        change_pct = ((price - pre_close) / pre_close * 100) if pre_close > 0 else 0
+        change_amt = price - pre_close
+        
+        return {
+            'code': code,
+            'name': fields[0],
+            'price': price,
+            'change': round(change_pct, 2),
+            'changeAmount': round(change_amt, 2),
+            'open': float(fields[1]),
+            'high': float(fields[4]),
+            'low': float(fields[5]),
+            'preClose': pre_close,
+            'volume': float(fields[8]),
+            'amount': float(fields[9]),
+            'turnover': float(fields[38]) if len(fields) > 38 and fields[38] else 0,
+            'amplitude': 0,
+            'pe': float(fields[39]) if len(fields) > 39 and fields[39] else 0,
+            'pb': 0,
+            'totalMarketCap': float(fields[45]) * 10000 / 100000000 if len(fields) > 45 and fields[45] else 0,
+            'floatMarketCap': float(fields[44]) * 10000 / 100000000 if len(fields) > 44 and fields[44] else 0,
+            'volumeRatio': 0,
+        }
+    except Exception as e:
+        print(f'新浪行情失败({code}): {e}')
+        return None
+
+
+# ==================== 腾讯财经API ====================
+
+def get_tencent_quote(code):
+    """腾讯财经实时行情"""
+    if code.startswith('6'):
+        symbol = f'sh{code}'
+    else:
+        symbol = f'sz{code}'
+    
+    url = f'https://qt.gtimg.cn/q={symbol}'
+    
+    try:
+        resp = requests.get(url, headers=HEADERS_TENCENT, timeout=8)
+        resp.encoding = 'gbk'
+        text = resp.text
+        
+        # 解析格式: v_sh600519="1~贵州茅台~600519~..."
+        start = text.find('"')
+        end = text.rfind('"')
+        if start < 0 or end <= start:
+            return None
+        
+        data_str = text[start+1:end]
+        fields = data_str.split('~')
+        if len(fields) < 45:
+            return None
+        
+        price = float(fields[3])
+        pre_close = float(fields[4])
+        change_pct = float(fields[32]) if fields[32] else 0
+        change_amt = float(fields[31]) if fields[31] else 0
+        
+        return {
+            'code': code,
+            'name': fields[1],
+            'price': price,
+            'change': round(change_pct, 2),
+            'changeAmount': round(change_amt, 2),
+            'open': float(fields[5]) if fields[5] else 0,
+            'high': float(fields[33]) if fields[33] else 0,
+            'low': float(fields[34]) if fields[34] else 0,
+            'preClose': pre_close,
+            'volume': float(fields[6]) if fields[6] else 0,
+            'amount': float(fields[37]) if fields[37] else 0,
+            'turnover': float(fields[38]) if len(fields) > 38 and fields[38] else 0,
+            'amplitude': float(fields[43]) if len(fields) > 43 and fields[43] else 0,
+            'pe': float(fields[39]) if len(fields) > 39 and fields[39] else 0,
+            'pb': float(fields[46]) if len(fields) > 46 and fields[46] else 0,
+            'totalMarketCap': float(fields[45]) / 10000 if len(fields) > 45 and fields[45] else 0,
+            'floatMarketCap': float(fields[44]) / 10000 if len(fields) > 44 and fields[44] else 0,
+            'volumeRatio': float(fields[49]) if len(fields) > 49 and fields[49] else 0,
+        }
+    except Exception as e:
+        print(f'腾讯行情失败({code}): {e}')
+        return None
+
+
+# ==================== 东方财富API ====================
+
+def get_eastmoney_quote(code):
+    """东方财富实时行情"""
+    for attempt in range(2):
         try:
             if code.startswith('6'):
                 secid = f'1.{code}'
@@ -32,7 +158,7 @@ def get_stock_quote(code):
             
             url = f'https://push2.eastmoney.com/api/qt/stock/get?secid={secid}&fields=f43,f44,f45,f46,f47,f48,f49,f50,f51,f52,f57,f58,f60,f107,f116,f117,f162,f167,f168,f169,f170,f171,f177,f183,f184'
             
-            resp = requests.get(url, headers=HEADERS, timeout=10)
+            resp = requests.get(url, headers=HEADERS_EASTMONEY, timeout=8)
             data = resp.json()
             if data.get('data'):
                 d = data['data']
@@ -57,10 +183,30 @@ def get_stock_quote(code):
                     'volumeRatio': d.get('f50', 0) / 100 if d.get('f50') else 0,
                 }
         except Exception as e:
-            if attempt < 2:
-                time.sleep(0.5)
+            if attempt < 1:
+                time.sleep(0.3)
                 continue
-            print(f'获取行情失败(重试{attempt+1}次): {e}')
+            print(f'东方财富行情失败({code}): {e}')
+    return None
+
+
+def get_stock_quote(code):
+    """获取股票实时行情（多数据源备份）"""
+    # 按顺序尝试：新浪 → 腾讯 → 东方财富
+    # 新浪和腾讯的服务器在国内，海外访问也比较稳定
+    
+    quote = get_sina_quote(code)
+    if quote and quote['price'] > 0:
+        return quote
+    
+    quote = get_tencent_quote(code)
+    if quote and quote['price'] > 0:
+        return quote
+    
+    quote = get_eastmoney_quote(code)
+    if quote and quote['price'] > 0:
+        return quote
+    
     return None
 
 
@@ -85,7 +231,7 @@ def get_kline_data(code, klt=101, fqt=1, lmt=60):
     url = f'http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},{period},,,{lmt},{fqt_str}'
     
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp = requests.get(url, headers=HEADERS_TENCENT, timeout=10)
         data = resp.json()
         
         # 解析腾讯财经返回格式
@@ -127,7 +273,7 @@ def get_kline_data(code, klt=101, fqt=1, lmt=60):
     url = f'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57&klt={klt}&fqt={fqt}&lmt={lmt}'
     
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp = requests.get(url, headers=HEADERS_EASTMONEY, timeout=10)
         data = resp.json()
         if data.get('data') and data['data'].get('klines'):
             klines = []
@@ -154,7 +300,7 @@ def search_stocks(keyword):
     url = f'https://searchapi.eastmoney.com/api/suggest/get?input={keyword}&type=14&token=D43BF722C8E33BDC906FB84D85E326E8&count=10'
     
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp = requests.get(url, headers=HEADERS_EASTMONEY, timeout=10)
         data = resp.json()
         results = []
         if data.get('QuotationCodeTable') and data['QuotationCodeTable'].get('Data'):
@@ -176,7 +322,7 @@ def get_sector_list():
     url = 'https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=20&po=1&np=1&fltt=2&invt=2&fid=f3&fs=m:90+t:2&fields=f2,f3,f4,f12,f14'
     
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp = requests.get(url, headers=HEADERS_EASTMONEY, timeout=10)
         data = resp.json()
         sectors = []
         if data.get('data') and data['data'].get('diff'):
@@ -206,7 +352,7 @@ def get_index_list():
     for idx in indices:
         url = f'https://push2.eastmoney.com/api/qt/stock/get?secid={idx["secid"]}&fields=f43,f44,f45,f46,f47,f48,f57,f58,f60,f169,f170'
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=5)
+            resp = requests.get(url, headers=HEADERS_EASTMONEY, timeout=5)
             data = resp.json()
             if data.get('data'):
                 d = data['data']
@@ -234,7 +380,7 @@ def get_sector_stocks(sector_code, limit=10):
     url = f'https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz={limit}&po=1&np=1&fltt=2&invt=2&fid=f3&fs=b:{sector_code}+f:!50&fields=f2,f3,f4,f5,f6,f7,f12,f14'
     
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp = requests.get(url, headers=HEADERS_EASTMONEY, timeout=10)
         data = resp.json()
         stocks = []
         if data.get('data') and data['data'].get('diff'):
@@ -266,7 +412,7 @@ def get_financial_data(code):
     url = f'https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_LICO_FN_CPD&columns=ALL&filter=(SECURITY_CODE="{code}")&pageSize=4&sortColumns=REPORT_DATE&sortTypes=-1'
     
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp = requests.get(url, headers=HEADERS_EASTMONEY, timeout=10)
         data = resp.json()
         records = []
         if data.get('result') and data['result'].get('data'):
@@ -898,7 +1044,7 @@ def api_news():
     url = 'https://np-listapi.eastmoney.com/comm/wap/getListInfo?cb=callback&client=wap&type=1&mTypeAndCol=1_70&pageSize=10&pageIndex=0'
     
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp = requests.get(url, headers=HEADERS_EASTMONEY, timeout=10)
         text = resp.text
         # 解析JSONP
         if text.startswith('callback('):
