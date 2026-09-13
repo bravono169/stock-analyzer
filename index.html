@@ -762,7 +762,9 @@ let macdChart = null;
 const CORS_PROXIES = [
   'https://api.allorigins.win/raw?url=',
   'https://corsproxy.io/?',
-  'https://api.codetabs.com/v1/proxy?quest='
+  'https://api.codetabs.com/v1/proxy?quest=',
+  'https://api.allorigins.win/get?url=',
+  'https://api.codetabs.com/v1/proxy/?quest=',
 ];
 
 // ============================================
@@ -802,19 +804,24 @@ function getUpDownClass(val) {
 // ============================================
 // JSONP 请求
 // ============================================
-function jsonp(url, callbackName) {
+let jsonpCounter = 0;
+
+function jsonp(url, callbackParam) {
   return new Promise((resolve, reject) => {
     const script = document.createElement('script');
-    const cbName = callbackName || ('jsonp_cb_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5));
+    const cbName = 'jsonp_cb_' + (++jsonpCounter) + '_' + Date.now();
+    const param = callbackParam || 'cb';
     
     const timeout = setTimeout(() => {
       cleanup();
       reject(new Error('JSONP timeout'));
-    }, 10000);
+    }, 12000);
     
     function cleanup() {
       clearTimeout(timeout);
-      if (window[cbName]) delete window[cbName];
+      if (window[cbName]) {
+        try { delete window[cbName]; } catch(e) { window[cbName] = null; }
+      }
       if (script.parentNode) script.parentNode.removeChild(script);
     }
     
@@ -825,12 +832,12 @@ function jsonp(url, callbackName) {
     
     script.onerror = function() {
       cleanup();
-      reject(new Error('JSONP error'));
+      reject(new Error('JSONP script error'));
     };
     
-    // 拼接cb参数
+    // 拼接cb参数（同时试cb和callback两个参数名，兼容不同API）
     const sep = url.indexOf('?') >= 0 ? '&' : '?';
-    script.src = url + sep + 'cb=' + cbName;
+    script.src = url + sep + param + '=' + cbName + '&callback=' + cbName;
     document.head.appendChild(script);
   });
 }
@@ -842,21 +849,223 @@ async function fetchWithProxy(url) {
   for (let i = 0; i < CORS_PROXIES.length; i++) {
     try {
       const proxyUrl = CORS_PROXIES[i] + encodeURIComponent(url);
-      const response = await fetch(proxyUrl, { signal: AbortSignal.timeout(8000) });
+      
+      // 使用AbortController实现超时
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
+      
+      const response = await fetch(proxyUrl, { signal: controller.signal });
+      clearTimeout(timeoutId);
+      
       if (response.ok) {
         const text = await response.text();
+        
+        // 情况1: 直接就是JSON
         try {
           return JSON.parse(text);
-        } catch (e) {
-          // 可能已经是JSON字符串包裹，再试一次
-          return text;
+        } catch (e) {}
+        
+        // 情况2: allorigins.win/get 格式 - { contents: "..." }
+        try {
+          const wrapper = JSON.parse(text);
+          if (wrapper.contents) {
+            // contents 里是实际内容，可能还是JSONP格式
+            const innerText = wrapper.contents;
+            try {
+              return JSON.parse(innerText);
+            } catch (e2) {
+              // 从JSONP里提取JSON
+              const match = innerText.match(/\(([\s\S]*)\)\s*;?\s*$/);
+              if (match) return JSON.parse(match[1]);
+            }
+          }
+        } catch (e) {}
+        
+        // 情况3: JSONP格式 callback({...})
+        const match = text.match(/\(([\s\S]*)\)\s*;?\s*$/);
+        if (match) {
+          try {
+            return JSON.parse(match[1]);
+          } catch (e2) {}
+        }
+        
+        // 情况4: 提取第一个{到最后一个}之间的内容
+        const jsonStart = text.indexOf('{');
+        const jsonEnd = text.lastIndexOf('}');
+        if (jsonStart >= 0 && jsonEnd > jsonStart) {
+          try {
+            return JSON.parse(text.substring(jsonStart, jsonEnd + 1));
+          } catch (e3) {}
         }
       }
     } catch (e) {
-      console.warn('Proxy ' + i + ' failed:', e.message);
+      console.warn('Proxy ' + i + ' (' + CORS_PROXIES[i] + ') failed:', e.message);
     }
   }
   throw new Error('All proxies failed');
+}
+
+// ============================================
+// 新浪财经 API（最稳定的JSONP数据源，首选）
+// ============================================
+
+// 新浪行情接口：返回 var hq_str_sh600519="名称,今开,昨收,现价,最高,最低,...";
+let sinaCallbackCounter = 0;
+
+function getSinaQuote(secid) {
+  return new Promise((resolve, reject) => {
+    // secid格式：1.600519 -> sh600519, 0.000001 -> sz000001
+    const parts = secid.split('.');
+    const prefix = parts[0] === '1' ? 'sh' : 'sz';
+    const code = parts[1];
+    const symbol = prefix + code;
+    
+    const cbName = 'sina_cb_' + (++sinaCallbackCounter) + '_' + Date.now();
+    const script = document.createElement('script');
+    
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('Sina timeout'));
+    }, 8000);
+    
+    function cleanup() {
+      clearTimeout(timeout);
+      if (window[cbName]) { try { delete window[cbName]; } catch(e) {} }
+      if (script.parentNode) script.parentNode.removeChild(script);
+    }
+    
+    // 新浪API是 var hq_str_xxx="..." 格式
+    // 我们用一个巧妙的方法：定义一个自定义函数来捕获
+    const origDefineProperty = Object.defineProperty;
+    let captured = false;
+    
+    window[cbName] = function(data) {
+      // 备用回调方式
+    };
+    
+    // 方法：直接加载脚本，然后读取全局变量
+    script.src = `https://hq.sinajs.cn/list=${symbol}`;
+    script.onerror = function() {
+      cleanup();
+      reject(new Error('Sina script error'));
+    };
+    
+    script.onload = function() {
+      try {
+        // 读取新浪设置的全局变量
+        const varName = 'hq_str_' + symbol;
+        const str = window[varName];
+        cleanup();
+        
+        if (str && str.length > 0) {
+          const fields = str.split(',');
+          if (fields.length >= 32) {
+            resolve({
+              code: code,
+              name: fields[0],
+              price: parseFloat(fields[3]),     // 现价
+              open: parseFloat(fields[1]),      // 今开
+              preClose: parseFloat(fields[2]),  // 昨收
+              high: parseFloat(fields[4]),      // 最高
+              low: parseFloat(fields[5]),       // 最低
+              volume: parseFloat(fields[8]),    // 成交量（股）
+              amount: parseFloat(fields[9]),    // 成交额
+              change: parseFloat(fields[3]) - parseFloat(fields[2]), // 涨跌额
+              changePct: ((parseFloat(fields[3]) - parseFloat(fields[2])) / parseFloat(fields[2]) * 100), // 涨跌幅
+              turnover: parseFloat(fields[38]) || 0, // 换手率
+              pe: parseFloat(fields[39]) || 0,      // PE
+              pb: 0,                                   // PB（新浪没有直接给）
+              totalMv: parseFloat(fields[45]) * 10000 || 0, // 总市值（万元转元）
+              flowMv: parseFloat(fields[44]) * 10000 || 0,  // 流通市值
+            });
+            return;
+          }
+        }
+        reject(new Error('Sina no data'));
+      } catch (e) {
+        cleanup();
+        reject(e);
+      }
+    };
+    
+    document.head.appendChild(script);
+  });
+}
+
+// 新浪批量获取行情（一次请求多只股票，更快更稳）
+function getSinaBatchQuotes(secids) {
+  return new Promise((resolve, reject) => {
+    const symbols = secids.map(secid => {
+      const parts = secid.split('.');
+      return (parts[0] === '1' ? 'sh' : 'sz') + parts[1];
+    });
+    
+    const script = document.createElement('script');
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('Sina batch timeout'));
+    }, 10000);
+    
+    function cleanup() {
+      clearTimeout(timeout);
+      if (script.parentNode) script.parentNode.removeChild(script);
+    }
+    
+    script.src = `https://hq.sinajs.cn/list=${symbols.join(',')}`;
+    script.onerror = function() {
+      cleanup();
+      reject(new Error('Sina batch script error'));
+    };
+    
+    script.onload = function() {
+      try {
+        const results = [];
+        for (let i = 0; i < secids.length; i++) {
+          const symbol = symbols[i];
+          const varName = 'hq_str_' + symbol;
+          const str = window[varName];
+          
+          if (str && str.length > 5) {
+            const fields = str.split(',');
+            if (fields.length >= 10) {
+              const code = secids[i].split('.')[1];
+              const price = parseFloat(fields[3]);
+              const preClose = parseFloat(fields[2]);
+              results.push({
+                code: code,
+                name: fields[0],
+                price: price,
+                open: parseFloat(fields[1]),
+                preClose: preClose,
+                high: parseFloat(fields[4]),
+                low: parseFloat(fields[5]),
+                volume: parseFloat(fields[8]),
+                amount: parseFloat(fields[9]),
+                change: price - preClose,
+                changePct: preClose > 0 ? ((price - preClose) / preClose * 100) : 0,
+                turnover: parseFloat(fields[38]) || 0,
+                pe: parseFloat(fields[39]) || 0,
+                pb: 0,
+                totalMv: (parseFloat(fields[45]) || 0) * 10000,
+                flowMv: (parseFloat(fields[44]) || 0) * 10000,
+              });
+            }
+          }
+        }
+        cleanup();
+        if (results.length > 0) {
+          resolve(results);
+        } else {
+          reject(new Error('Sina batch no data'));
+        }
+      } catch (e) {
+        cleanup();
+        reject(e);
+      }
+    };
+    
+    document.head.appendChild(script);
+  });
 }
 
 // ============================================
@@ -865,6 +1074,15 @@ async function fetchWithProxy(url) {
 
 // 获取股票实时行情
 async function getStockQuote(secid) {
+  // 先试新浪财经（最稳定）
+  try {
+    const quote = await getSinaQuote(secid);
+    if (quote && quote.price > 0) return quote;
+  } catch (e) {
+    console.warn('新浪行情失败，尝试东方财富:', e.message);
+  }
+  
+  // 再试东方财富 JSONP
   const url = `https://push2.eastmoney.com/api/qt/stock/get?secid=${secid}&fields=f43,f44,f45,f46,f47,f48,f57,f58,f60,f116,f117,f162,f167,f168,f169,f170`;
   try {
     const data = await jsonp(url);
@@ -1494,7 +1712,7 @@ async function renderWatchlist() {
           <div class="stock-code">${stock.code}</div>
         </div>
         <div class="stock-price">
-          <div class="price" id="p_${stock.secid}">--</div>
+          <div class="price" id="p_${stock.secid}">加载中...</div>
           <div class="change" id="c_${stock.secid}">--</div>
         </div>
         <button class="delete-btn" onclick="event.stopPropagation(); removeFromWatchlist('${stock.secid}')">删除</button>
@@ -1506,31 +1724,101 @@ async function renderWatchlist() {
   const quotes = [];
   let upCount = 0;
   let downCount = 0;
+  let failCount = 0;
   
-  for (const stock of watchlist) {
-    try {
-      const quote = await getStockQuote(stock.secid);
-      quotes.push(quote);
-      
-      const priceEl = document.getElementById('p_' + stock.secid);
-      const changeEl = document.getElementById('c_' + stock.secid);
-      
-      if (priceEl && changeEl) {
-        const cls = getUpDownClass(quote.changePct);
-        priceEl.textContent = formatNum(quote.price);
-        priceEl.className = 'price ' + cls;
-        changeEl.textContent = formatPercent(quote.changePct);
-        changeEl.className = 'change ' + cls;
+  // 优先用新浪批量接口（一次获取全部，更快更稳）
+  const secids = watchlist.map(s => s.secid);
+  
+  try {
+    const batchQuotes = await getSinaBatchQuotes(secids);
+    
+    for (const stock of watchlist) {
+      const quote = batchQuotes.find(q => q.code === stock.code);
+      if (quote && quote.price > 0) {
+        // 更新名称（新浪返回的名称可能更准确）
+        if (quote.name && quote.name !== stock.name) {
+          stock.name = quote.name;
+        }
+        
+        const priceEl = document.getElementById('p_' + stock.secid);
+        const changeEl = document.getElementById('c_' + stock.secid);
+        
+        if (priceEl && changeEl) {
+          const cls = getUpDownClass(quote.changePct);
+          priceEl.textContent = formatNum(quote.price);
+          priceEl.className = 'price ' + cls;
+          changeEl.textContent = formatPercent(quote.changePct);
+          changeEl.className = 'change ' + cls;
+        }
+        
+        quotes.push(quote);
+        if (quote.changePct > 0) upCount++;
+        else if (quote.changePct < 0) downCount++;
+      } else {
+        failCount++;
       }
-      
-      if (quote.changePct > 0) upCount++;
-      else if (quote.changePct < 0) downCount++;
-    } catch (e) {
-      console.error('获取行情失败:', stock.code, e);
+    }
+  } catch (e) {
+    console.warn('新浪批量获取失败，尝试逐个获取:', e.message);
+    
+    // 新浪批量失败，逐个获取（多数据源备份）
+    for (const stock of watchlist) {
+      try {
+        const quote = await getStockQuote(stock.secid);
+        if (quote && quote.price > 0) {
+          quotes.push(quote);
+          
+          if (quote.name && quote.name !== stock.name) {
+            stock.name = quote.name;
+          }
+          
+          const priceEl = document.getElementById('p_' + stock.secid);
+          const changeEl = document.getElementById('c_' + stock.secid);
+          
+          if (priceEl && changeEl) {
+            const cls = getUpDownClass(quote.changePct);
+            priceEl.textContent = formatNum(quote.price);
+            priceEl.className = 'price ' + cls;
+            changeEl.textContent = formatPercent(quote.changePct);
+            changeEl.className = 'change ' + cls;
+          }
+          
+          if (quote.changePct > 0) upCount++;
+          else if (quote.changePct < 0) downCount++;
+        } else {
+          failCount++;
+          setStockFail(stock.secid);
+        }
+      } catch (e2) {
+        failCount++;
+        console.error('获取行情失败:', stock.code, e2.message);
+        setStockFail(stock.secid);
+      }
     }
   }
   
+  // 如果全部失败，显示错误提示
+  if (failCount === watchlist.length && watchlist.length > 0) {
+    const failTip = document.createElement('div');
+    failTip.style.cssText = 'text-align:center;padding:15px;color:#e67e22;font-size:15px;line-height:1.8;';
+    failTip.innerHTML = '⚠️ 数据加载失败<br><span style="font-size:13px;color:#999;">点击下方按钮重试</span>';
+    listEl.appendChild(failTip);
+    
+    const retryBtn = document.createElement('button');
+    retryBtn.textContent = '🔄 重新加载';
+    retryBtn.style.cssText = 'display:block;margin:10px auto 0;padding:10px 30px;background:linear-gradient(135deg,#ff6b6b,#ee5a24);color:#fff;border:none;border-radius:20px;font-size:16px;cursor:pointer;';
+    retryBtn.onclick = function() { renderWatchlist(); };
+    listEl.appendChild(retryBtn);
+  }
+  
   updateOverview(quotes, upCount, downCount);
+}
+
+function setStockFail(secid) {
+  const priceEl = document.getElementById('p_' + secid);
+  const changeEl = document.getElementById('c_' + secid);
+  if (priceEl) { priceEl.textContent = '--'; priceEl.style.color = '#999'; }
+  if (changeEl) { changeEl.textContent = '加载失败'; changeEl.style.color = '#999'; }
 }
 
 function updateOverview(quotes, upCount, downCount) {
