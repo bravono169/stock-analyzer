@@ -1069,37 +1069,120 @@ function getSinaBatchQuotes(secids) {
 }
 
 // ============================================
+// 网易财经 API（备用数据源，防盗链较松）
+// ============================================
+function get163Quote(secid) {
+  return new Promise((resolve, reject) => {
+    const parts = secid.split('.');
+    const prefix = parts[0] === '1' ? '0' : '1'; // 网易：0开头是沪市，1是深市
+    const code = parts[1];
+    const symbol = prefix + code;
+    
+    const script = document.createElement('script');
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('163 timeout'));
+    }, 8000);
+    
+    function cleanup() {
+      clearTimeout(timeout);
+      if (script.parentNode) script.parentNode.removeChild(script);
+    }
+    
+    // 网易接口返回格式：var hq_str_0600519="..."
+    script.src = `https://api.money.126.net/data/feed/${symbol},money.api?callback=_ntes_quote_callback`;
+    script.onerror = function() {
+      cleanup();
+      reject(new Error('163 script error'));
+    };
+    
+    // 网易用固定的回调函数名
+    window._ntes_quote_callback = function(data) {
+      cleanup();
+      try {
+        const stockData = data[symbol] || data[code];
+        if (stockData && stockData.price) {
+          resolve({
+            code: code,
+            name: stockData.name || '',
+            price: stockData.price,
+            open: stockData.open || 0,
+            preClose: stockData.yestclose || 0,
+            high: stockData.high || 0,
+            low: stockData.low || 0,
+            volume: stockData.volume || 0,
+            amount: stockData.turnover || 0,
+            change: stockData.price - (stockData.yestclose || 0),
+            changePct: stockData.percent || 0,
+            turnover: stockData.turnoverratio || 0,
+            pe: stockData.pe || 0,
+            pb: 0,
+            totalMv: (stockData.mktcap || 0) * 10000,
+            flowMv: (stockData.nmc || 0) * 10000,
+          });
+        } else {
+          reject(new Error('163 no data'));
+        }
+      } catch (e) {
+        reject(e);
+      }
+    };
+    
+    document.head.appendChild(script);
+  });
+}
+
+// ============================================
 // 东方财富 API 封装
 // ============================================
 
-// 获取股票实时行情
+// 获取股票实时行情（多数据源备份）
 async function getStockQuote(secid) {
-  // 先试新浪财经（最稳定）
+  const errors = [];
+  
+  // 第1个：新浪财经（script标签加载，速度快）
   try {
     const quote = await getSinaQuote(secid);
     if (quote && quote.price > 0) return quote;
   } catch (e) {
-    console.warn('新浪行情失败，尝试东方财富:', e.message);
+    errors.push('新浪:' + e.message);
+    console.warn('[数据源1] 新浪失败:', e.message);
   }
   
-  // 再试东方财富 JSONP
+  // 第2个：网易财经（JSONP，防盗链松）
+  try {
+    const quote = await get163Quote(secid);
+    if (quote && quote.price > 0) return quote;
+  } catch (e) {
+    errors.push('网易:' + e.message);
+    console.warn('[数据源2] 网易失败:', e.message);
+  }
+  
+  // 第3个：东方财富 JSONP
   const url = `https://push2.eastmoney.com/api/qt/stock/get?secid=${secid}&fields=f43,f44,f45,f46,f47,f48,f57,f58,f60,f116,f117,f162,f167,f168,f169,f170`;
   try {
     const data = await jsonp(url);
     if (data && data.data) {
       return parseQuoteData(data.data);
     }
-    throw new Error('No data');
   } catch (e) {
-    // JSONP失败，用代理
-    try {
-      const data = await fetchWithProxy(url + '&cb=callback');
-      if (data && data.data) {
-        return parseQuoteData(data.data);
-      }
-    } catch (e2) {}
-    throw e;
+    errors.push('东方财富JSONP:' + e.message);
+    console.warn('[数据源3] 东方财富JSONP失败:', e.message);
   }
+  
+  // 第4个：东方财富 + CORS代理
+  try {
+    const data = await fetchWithProxy(url + '&cb=callback');
+    if (data && data.data) {
+      return parseQuoteData(data.data);
+    }
+  } catch (e) {
+    errors.push('CORS代理:' + e.message);
+    console.warn('[数据源4] CORS代理失败:', e.message);
+  }
+  
+  // 全部失败
+  throw new Error('所有数据源失败: ' + errors.join(' | '));
 }
 
 function parseQuoteData(d) {
@@ -1797,11 +1880,59 @@ async function renderWatchlist() {
     }
   }
   
-  // 如果全部失败，显示错误提示
+  // 如果全部失败，尝试用K线数据降级显示（最后一根K线的收盘价）
+  if (failCount === watchlist.length && watchlist.length > 0) {
+    console.warn('所有实时行情接口失败，尝试K线数据降级...');
+    
+    for (const stock of watchlist) {
+      try {
+        const klines = await getKlineData(stock.secid, 5);
+        if (klines && klines.length >= 2) {
+          const last = klines[klines.length - 1];
+          const prev = klines[klines.length - 2];
+          const changePct = ((last.close - prev.close) / prev.close * 100);
+          
+          const quote = {
+            code: stock.code,
+            name: stock.name,
+            price: last.close,
+            change: last.close - prev.close,
+            changePct: changePct,
+            open: last.open,
+            high: last.high,
+            low: last.low,
+            preClose: prev.close,
+            volume: last.volume,
+            amount: last.amount,
+          };
+          
+          const priceEl = document.getElementById('p_' + stock.secid);
+          const changeEl = document.getElementById('c_' + stock.secid);
+          
+          if (priceEl && changeEl) {
+            const cls = getUpDownClass(changePct);
+            priceEl.textContent = formatNum(last.close);
+            priceEl.className = 'price ' + cls;
+            changeEl.textContent = formatPercent(changePct);
+            changeEl.className = 'change ' + cls;
+          }
+          
+          quotes.push(quote);
+          failCount--;
+          if (changePct > 0) upCount++;
+          else if (changePct < 0) downCount++;
+        }
+      } catch (ke) {
+        console.warn('K线降级也失败:', stock.code, ke.message);
+      }
+    }
+  }
+  
+  // 如果还是全部失败，显示错误提示
   if (failCount === watchlist.length && watchlist.length > 0) {
     const failTip = document.createElement('div');
     failTip.style.cssText = 'text-align:center;padding:15px;color:#e67e22;font-size:15px;line-height:1.8;';
-    failTip.innerHTML = '⚠️ 数据加载失败<br><span style="font-size:13px;color:#999;">点击下方按钮重试</span>';
+    failTip.innerHTML = '⚠️ 数据加载失败<br><span style="font-size:13px;color:#999;">网络可能不稳定，点击按钮重试</span>';
     listEl.appendChild(failTip);
     
     const retryBtn = document.createElement('button');
